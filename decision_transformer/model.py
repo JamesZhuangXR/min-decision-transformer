@@ -42,7 +42,7 @@ class MaskedCausalAttention(nn.Module):
         self.register_buffer('mask',mask)
 
     def forward(self, x):
-        B, T, C = x.shape # batch size, seq length, h_dim * n_heads
+        B, T, C = x.shape # batch size, seq length, h_dim
 
         N, D = self.n_heads, C // self.n_heads # N = num heads, D = attention dim
 
@@ -126,11 +126,11 @@ class DecisionTransformer(nn.Module):
         )
 
 
-    def forward(self, timesteps, states, actions, returns_to_go):
+    def forward(self, timesteps, states, actions, returns_to_go, time_gamma = 1):
 
         B, T, _ = states.shape
 
-        time_embeddings = self.embed_timestep(timesteps)
+        time_embeddings = self.embed_timestep(timesteps) * time_gamma
 
         # time embeddings are treated similar to positional embeddings
         state_embeddings = self.embed_state(states) + time_embeddings
