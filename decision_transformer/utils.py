@@ -3,8 +3,12 @@ import time
 import pickle
 import torch
 import numpy as np
+import gym
+from copy import deepcopy as dc
 from torch.utils.data import Dataset
 from decision_transformer.d4rl_infos import REF_MIN_SCORE, REF_MAX_SCORE, D4RL_DATASET_STATS
+from HerWrapper import HerWrapper
+from RanTgtWrapper import RanTgtWrapper
 
 
 def discount_cumsum(x, gamma):
@@ -17,6 +21,8 @@ def discount_cumsum(x, gamma):
 
 def get_d4rl_normalized_score(score, env_name):
     env_key = env_name.split('-')[0].lower()
+    if env_key == 'maze2d':
+        env_key = env_key + '-' + env_name.split('-')[1].lower()
     assert env_key in REF_MAX_SCORE, f'no reference score for {env_key} env to calculate d4rl score'
     return (score - REF_MIN_SCORE[env_key]) / (REF_MAX_SCORE[env_key] - REF_MIN_SCORE[env_key])
 
@@ -27,7 +33,7 @@ def get_d4rl_dataset_stats(env_d4rl_name):
 
 def evaluate_on_env(model, device, context_len, env, rtg_target, rtg_scale,
                     num_eval_ep=10, max_test_ep_len=1000,
-                    state_mean=None, state_std=None, render=False):
+                    state_mean=None, state_std=None, render=False, time_gamma = 1.):
 
     eval_batch_size = 1  # required for forward pass
 
@@ -57,7 +63,7 @@ def evaluate_on_env(model, device, context_len, env, rtg_target, rtg_scale,
 
     with torch.no_grad():
 
-        for _ in range(num_eval_ep):
+        for step in range(num_eval_ep):
 
             # zeros place holders
             actions = torch.zeros((eval_batch_size, max_test_ep_len, act_dim),
@@ -69,6 +75,7 @@ def evaluate_on_env(model, device, context_len, env, rtg_target, rtg_scale,
 
             # init episode
             running_state = env.reset()
+            traj_reward = 0
             running_reward = 0
             running_rtg = rtg_target / rtg_scale
 
@@ -88,13 +95,15 @@ def evaluate_on_env(model, device, context_len, env, rtg_target, rtg_scale,
                     _, act_preds, _ = model.forward(timesteps[:,:context_len],
                                                 states[:,:context_len],
                                                 actions[:,:context_len],
-                                                rewards_to_go[:,:context_len])
+                                                rewards_to_go[:,:context_len],
+                                                time_gamma = time_gamma)
                     act = act_preds[0, t].detach()
                 else:
                     _, act_preds, _ = model.forward(timesteps[:,t-context_len+1:t+1],
                                                 states[:,t-context_len+1:t+1],
                                                 actions[:,t-context_len+1:t+1],
-                                                rewards_to_go[:,t-context_len+1:t+1])
+                                                rewards_to_go[:,t-context_len+1:t+1],
+                                                time_gamma = time_gamma)
                     act = act_preds[0, -1].detach()
 
                 running_state, running_reward, done, _ = env.step(act.cpu().numpy())
@@ -102,12 +111,15 @@ def evaluate_on_env(model, device, context_len, env, rtg_target, rtg_scale,
                 # add action in placeholder
                 actions[0, t] = act
 
-                total_reward += running_reward
+                traj_reward += running_reward
 
                 if render:
                     env.render()
                 if done:
                     break
+
+            print("Episode:{0}\treward:{1}\tSteps:{2}".format(step, traj_reward, t))
+            total_reward += traj_reward
 
     results['eval/avg_reward'] = total_reward / num_eval_ep
     results['eval/avg_ep_len'] = total_timesteps / num_eval_ep
@@ -116,13 +128,24 @@ def evaluate_on_env(model, device, context_len, env, rtg_target, rtg_scale,
 
 
 class D4RLTrajectoryDataset(Dataset):
-    def __init__(self, dataset_path, context_len, rtg_scale):
+    def __init__(self, dataset_path, context_len, rtg_scale, end_seq_num = -1, use_HER = False,
+                 k_future = None):
 
         self.context_len = context_len
+        self.use_HER = use_HER
+        self.rtg_scale = rtg_scale
+        self.k_future = k_future
+        if k_future is not None:
+            self.future_p = 1.0 - 1.0 / (1 + k_future)
+        else:
+            self.future_p = 0
 
         # load dataset
         with open(dataset_path, 'rb') as f:
             self.trajectories = pickle.load(f)
+
+        self.env_name = dataset_path.split('.')[0].split('/')[-1]
+        self.env = RanTgtWrapper(HerWrapper(gym.make(self.env_name)))
 
         # calculate min len of traj, state mean and variance
         # and returns_to_go for all traj
@@ -133,15 +156,21 @@ class D4RLTrajectoryDataset(Dataset):
             min_len = min(min_len, traj_len)
             states.append(traj['observations'])
             # calculate returns to go and rescale them
-            traj['returns_to_go'] = discount_cumsum(traj['rewards'], 1.0) / rtg_scale
+            traj['returns_to_go'] = discount_cumsum(traj['rewards'], 1.0) / self.rtg_scale
+            if end_seq_num == -1:
+                traj['index'] = np.arange(0, traj_len, 1)
+            else:
+                traj['index'] = np.arange(end_seq_num - traj_len, end_seq_num, 1)
 
         # used for input normalization
         states = np.concatenate(states, axis=0)
         self.state_mean, self.state_std = np.mean(states, axis=0), np.std(states, axis=0) + 1e-6
 
         # normalize states
+        '''
         for traj in self.trajectories:
             traj['observations'] = (traj['observations'] - self.state_mean) / self.state_std
+        '''
 
     def get_state_stats(self):
         return self.state_mean, self.state_std
@@ -160,10 +189,27 @@ class D4RLTrajectoryDataset(Dataset):
             states = torch.from_numpy(traj['observations'][si : si + self.context_len])
             actions = torch.from_numpy(traj['actions'][si : si + self.context_len])
             returns_to_go = torch.from_numpy(traj['returns_to_go'][si : si + self.context_len])
-            timesteps = torch.arange(start=si, end=si+self.context_len, step=1)
+            timesteps = torch.from_numpy(traj['index'][si : si + self.context_len])
+            # timesteps = torch.arange(start=si, end=si+self.context_len, step=1)
 
             # all ones since no padding
             traj_mask = torch.ones(self.context_len, dtype=torch.long)
+
+            if self.use_HER:
+
+                offset = traj_len - self.context_len - si
+                if offset != 0 and np.random.uniform() < self.future_p:
+                    future_off = int(np.random.uniform() * offset)
+                    future_t = future_off + self.context_len + si
+
+                    # print(traj.keys())
+
+                    pos = traj['infos/qpos'][future_t]
+                    n_pos = pos.shape[-1]
+                    states[:,-n_pos:] = torch.from_numpy(pos)
+                    rew = self.env.compute_reward(states[:, :n_pos], states[:, -n_pos:])
+
+                    returns_to_go = torch.from_numpy(discount_cumsum(rew, 1.0) / self.rtg_scale)
 
         else:
             padding_len = self.context_len - traj_len
@@ -187,10 +233,24 @@ class D4RLTrajectoryDataset(Dataset):
                                 dtype=returns_to_go.dtype)],
                                dim=0)
 
-            timesteps = torch.arange(start=0, end=self.context_len, step=1)
+            # timesteps = torch.arange(start=0, end=self.context_len, step=1)
+            timesteps = torch.from_numpy(traj['index'])
+            timesteps = torch.cat([timesteps,
+                                   torch.zeros(([padding_len] + list(timesteps.shape[1:])),
+                                   dtype=actions.dtype)],
+                                  dim=0)
 
             traj_mask = torch.cat([torch.ones(traj_len, dtype=torch.long),
                                    torch.zeros(padding_len, dtype=torch.long)],
                                   dim=0)
 
+        states = (states - self.state_mean) / self.state_std
+
         return  timesteps, states, actions, returns_to_go, traj_mask
+
+
+def set_random_seed(seed):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    random.seed(seed)
